@@ -1,0 +1,2036 @@
+---
+title: "Actigraphy data analysis"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: yes 
+    toc_depth: 3  
+    number_sections: true  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = FALSE,
+                      warning = FALSE, out.width="100%")
+```
+
+# R libraries and version
+
+```{r libraries}
+
+library(readxl) # to read excel files
+library(haven)  # to read sav files
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(kableExtra)
+library(ggplot2)
+library(summarytools)
+library(corrplot)
+library(lmerTest)
+library(broom.mixed)
+library(forcats)
+library(emmeans)
+library(performance)
+R.version
+
+```
+
+# Load data
+
+```{r data}
+# GGIR part 5 summaries
+part5_allmeas <- read.csv("data/part5_daysummary_WW_L56.3M191.6V695.8_T5A5.csv")
+# Emma's register of timepoints
+part_TP_register <- read_excel("data/Actiwatch_completion_by_timepoint.xlsx")
+# SPSS data
+part_data_other <- read_sav("data/Actiwatch study dataset2.sav")
+```
+
+
+# Create extra folders
+
+To save the results
+
+```{r extra_folders}
+# Create output folders if they do not exist
+dir.create("plots_out", showWarnings = FALSE)
+dir.create("mod_summaries", showWarnings = FALSE)
+dir.create("clean_dat", showWarnings = FALSE)
+dir.create("mod_summaries/diagnostics_plots", showWarnings = FALSE) 
+dir.create("mod_summaries/diagnostics_txt", showWarnings = FALSE)
+```
+
+
+# Performance check function
+
+```{r performance_check_func}
+mod_perf_check <- function(mod_names) {
+  for (m in mod_names) {
+    
+    model <- get(m)
+    
+    # Diagnostic tests for this model
+    diagnostic_summary <- list(
+      model = m,
+      normality = tryCatch(
+        check_normality(model),
+        error = function(e) NA
+      ),
+      heteroscedasticity = tryCatch(
+        check_heteroscedasticity(model),
+        error = function(e) NA
+      ),
+      outliers = tryCatch(
+        check_outliers(model),
+        error = function(e) NA
+      )
+    )
+    
+    capture.output(
+      print(diagnostic_summary),
+      file = paste0("mod_summaries/diagnostics_txt/", m, "_diagnostic_summary.txt")
+    )
+    
+    # Using check_model function
+    png(
+      paste0("mod_summaries/diagnostics_plots/", m, "_diagnostics.png"),
+      width = 1400,
+      height = 1000
+    )
+    print(check_model(model))
+    dev.off()
+    
+    # Typical plots
+    png(
+      paste0("mod_summaries/diagnostics_plots/", m, "_diagnostics2.png"),
+      width = 1400,
+      height = 1000
+    )
+    
+    par(mfrow = c(1, 2))
+    
+    # Residuals vs fitted plot
+    plot(
+      fitted(model),
+      resid(model),
+      main = paste0(m, "\nResiduals vs fitted"),
+      xlab = "Fitted values",
+      ylab = "Residuals",
+      pch = 16,
+      col = rgb(0, 0, 0, 0.4)
+    )
+    abline(h = 0, lty = 2, col = "red")
+    
+    # Q-Q plot of residuals
+    qqnorm(
+      resid(model),
+      main = paste0(m, "\nNormal Q-Q plot"),
+      pch = 16,
+      col = rgb(0, 0, 0, 0.4)
+    )
+    qqline(resid(model), col = "red", lwd = 2)
+    
+    dev.off()
+  }
+}
+```
+
+
+# Data cleaning
+
+## Actigraphy data
+
+Start by selecting relevant variables for the analysis
+
+```{r datcleaning}
+
+# Select relevant columns
+part5_allmeas2 <- part5_allmeas %>% 
+  dplyr::select(ID,
+                filename, 
+                calendar_date, 
+                weekday, 
+                night_number,                   
+                dur_day_total_IN_min,           # Total inactivity minutes during day
+                dur_day_total_LIG_min,          # Total light activity minutes during day 
+                dur_day_total_MOD_min,          # Total moderate activity minutes during day
+                dur_day_total_VIG_min,          # Total vigorous activity minutes during day
+                sleep_efficiency_after_onset,   # Sleep efficiency
+                dur_spt_min,                    # Sleep period (onset-waketime)
+                dur_spt_sleep_min,              # Total sleep time (TST)
+                daysleeper,                     # Sleep time is during the day (1)/ night (0)
+                nonwear_perc_day                # Non-wear percentage during the day
+                )
+# Add ID and measurement timepoint columns
+part5_allmeas2 <- part5_allmeas2 %>%
+  mutate(
+    ID        = str_extract(ID, "\\d+") %>% as.numeric(),          # e.g. 320
+    timepoint = str_extract(filename, "(?<=_)[^_]+")    # e.g. T4
+  )
+# Check how many timepoints per person
+n_summary <- part5_allmeas2 %>%
+  dplyr::count(ID, timepoint, name = "n_meas") %>%
+  dplyr::group_by(ID) %>%
+  dplyr::summarise(
+    n_totmeas    = sum(n_meas),
+    n_timepoints = dplyr::n(),  # number of distinct timepoints for that ID
+    meas_by_tp   = paste0(timepoint, "=", n_meas, collapse = ", "),
+    .groups = "drop"
+  )
+table(n_summary$n_timepoints) %>% 
+  kable(
+    col.names = c("Number of timepoints", "Number of Participants"),
+    caption = "How many participants have data for 1, 2 3 or all timepoints?",
+    row.names = FALSE, align = "c", format = "markdown", digits = 3
+  )%>%
+  kable_styling()
+```
+
+These IDs are in the register (of receiving an actiwatch), but not in the GGIR cleaned summary: `r part_TP_register %>% filter(!(.data[["Participant ID"]] %in% part5_allmeas2$ID)) %>% pull(.data[["Participant ID"]]) %>% unique() `
+
+```{r peopl_timepoint}
+
+part5_allmeas2 %>%
+  dplyr::distinct(ID, timepoint) %>%
+  mutate(timepoint = factor(timepoint, levels = c("T1", "T2", "T3", "T4"))) %>%
+  dplyr::count(timepoint, name = "n_people", .drop = FALSE) %>% 
+  kable(
+    caption = "Number of participants per timepoint",
+    col.names = c("Timepoint", "Number of participants"),
+    row.names = FALSE, align = "c", format = "markdown", digits = 3
+  ) %>% kable_styling()
+
+```
+
+
+GGIR does the following cleaning:
+
+- A night is excluded from the ‘cleaned’ based on having or not having a sleeplog:
+
+  1. If the study proposed a sleep log to the individuals, then nights are excluded for which the sleep log was not used as a guider, i.e., nights with [cleaningcode](https://wadpac.github.io/GGIR/articles/chapter10_SleepAnalysis.html#quality-assurance) not equal to 0 or variable sleep log used equals FALSE. 
+  
+  2. If the study did not propose a sleep log to the individuals, then all nights are removed with cleaningcode higher than 1.
+
+- A day is excluded if the number of valid hours is less than the one given in the input (here < 16 hours).
+
+Save a register of the comparison between the register and data.
+
+```{r datcleaning2}
+part_TP_comparison <- left_join(n_summary, part_TP_register, by = join_by("ID" == "Participant ID")) %>%
+  mutate(
+    same_tp = ifelse(as.numeric(n_timepoints) == `Number of actiwatches`,"yes", "no") 
+  )
+# Save to have a register
+write.csv(part_TP_comparison, "comparison_TP_in_Part5_summary_Emma_register.csv", row.names = FALSE)
+```
+
+Check unusual missing patterns in the data and make them NA if needed.
+
+```{r datacleaning3}
+# Check for weird NA patterns 
+na_markers <- list(-9999, -999, -99, "NA", "N/A", "na", "null", "NULL", "None", "", " ")
+for (marker in na_markers) {
+  count <- sum(part5_allmeas2 == marker, na.rm = TRUE)
+  cat(sprintf("%s: %d\n", deparse(marker), count))
+} # No changes
+```
+
+We filter daysleepers.
+
+```{r daysleepers}
+part5_allmeas2 <- part5_allmeas2 %>% filter(daysleeper != 1)
+```
+
+If a person has more than seven measurements, we take those will less non-wear percent during day. This is to align to the experiment, as they were told to use the watch for 7 days.
+
+```{r moresevendays}
+# sum(is.na(part5_allmeas2$nonwear_perc_day)) #0
+part5_allmeasclean <- part5_allmeas2 %>%
+  arrange(ID, timepoint, nonwear_perc_day) %>%
+  group_by(ID, timepoint) %>%
+  slice_head(n = 7) %>%
+  ungroup()
+```
+
+
+To be included in the analysis and for reliability, a participant must have at least 3 valid days of actigraphy data [REF]. We filter those that meet this criteria.
+
+```{r threevaliddays}
+part5_allmeasclean2 <- part5_allmeasclean %>%
+  dplyr::group_by(ID, timepoint) %>%
+  dplyr::filter(dplyr::n() >= 3) %>%
+  dplyr::ungroup()
+
+data.frame(obs = c(nrow(part5_allmeas2),nrow(part5_allmeasclean2),nrow(part5_allmeas2)-nrow(part5_allmeasclean2)), row.names = c('original','cleaned','removed')) %>% kable(
+  col.names = "Observations",
+  caption = "Observations in the original GGIR output versus the cleaned data"
+) %>% kable_styling()
+```
+
+Compute variables needed for analysis but not computed in the output.
+
+```{r extravars}
+part5_allmeasclean2 <- part5_allmeasclean2 %>% mutate(
+  active_dur = dur_day_total_LIG_min +  dur_day_total_MOD_min +  dur_day_total_VIG_min, 
+  mvpa_dur =  dur_day_total_MOD_min +  dur_day_total_VIG_min,
+  WASO = dur_spt_min - dur_spt_sleep_min
+) %>% rename(
+  TST = dur_spt_sleep_min,
+  SE = sleep_efficiency_after_onset
+)
+```
+
+Compute mean variables per ID and timepoint.
+
+```{r meanderiveddat}
+part5_meanmeas_derived <- part5_allmeasclean2 %>%
+  dplyr::select(-filename, -calendar_date, -weekday, -night_number, -daysleeper, -nonwear_perc_day) %>%
+  dplyr::group_by(ID,timepoint) %>%
+  dplyr::summarise(
+    across(where(is.numeric), ~ mean(.x, na.rm = T)),
+    .groups =  "drop"
+  )
+```
+
+Filter those IDs with 2 or more timepoints.
+
+```{r meanderiveddat2}
+ID_more1TP <- part5_meanmeas_derived %>%
+  dplyr::group_by(ID) %>%
+  dplyr::summarise(
+    n_timepoints = dplyr::n(),
+    .groups = "drop"
+  ) %>% 
+  filter(n_timepoints > 1) %>%
+  pull(ID)
+part5_meanmeas_derived2 <- part5_meanmeas_derived %>%
+  filter(ID %in% ID_more1TP) %>%
+  mutate(timepoint = factor(timepoint, levels = c("T1", "T2", "T3", "T4")))
+
+#write.csv(part5_meanmeas_derived2, "clean_dat/final_participant_dat_for_analysis.csv", row.names = FALSE)
+```
+
+Number of unique IDs: `r length(unique(part5_meanmeas_derived2$ID))` 
+
+```{r checks_complexity}
+# Check how many timepoints per person
+n_summary <- part5_meanmeas_derived2 %>%
+  dplyr::count(ID, timepoint, name = "n_meas") %>%
+  dplyr::group_by(ID) %>%
+  dplyr::summarise(
+    n_totmeas    = sum(n_meas),
+    n_timepoints = dplyr::n(),  # number of distinct timepoints for that ID
+    meas_by_tp   = paste0(timepoint, "=", n_meas, collapse = ", "),
+    .groups = "drop"
+  )
+table(n_summary$n_timepoints) %>% 
+  kable(
+    col.names = c("Number of timepoints", "Number of Participants"),
+    caption = "How many participants have data for 1, 2 3 or all timepoints?",
+    row.names = FALSE, align = "c", format = "markdown", digits = 3
+  )%>%
+  kable_styling()
+```
+
+**Note:** Due to limited repeated observations per participant and incomplete timepoint coverage, models including random slopes for timepoint won't be estimable. Therefore, random intercept models are used.
+
+## Other data
+
+Take out metadata from sav data frame.
+
+```{r othercleaning}
+part_data_other_clean <- part_data_other %>%
+  # Remove columns not used
+  select(-childethnic_text, -childethnic) %>%
+  # Remove metadata
+  mutate(
+    across(everything(), zap_labels), 
+    across(everything(), zap_label),
+    across(everything(), zap_formats)
+  ) %>%
+  # To tibble
+  as_tibble()
+```
+
+Check for weird NA patterns and make them NA.
+
+```{r othercleaning2}
+na_markers <- list("-999.00", -999, -99, "NA", "N/A", "na", "null", "NULL", "None", "", " ")
+for (marker in na_markers) {
+  count <- sum(part_data_other_clean == marker, na.rm = TRUE)
+  cat(sprintf("%s: %d\n", deparse(marker), count))
+}
+part_data_other_clean2 <- part_data_other_clean %>%
+  mutate(across(everything(), ~ replace(., . == "", NA))) %>%
+  mutate(across(everything(), ~ replace(., . == "-999.00", NA))) %>%
+  mutate(Age = as.numeric(Age))
+```
+
+Reshape data to long version.
+
+```{r otherlong}
+part_data_long <- part_data_other_clean2 %>%
+  # Remove unused columns
+  dplyr::select(-contains("PROMIS")) %>%
+  mutate(
+    ARCSMean10_pt1 = ARCS10itemMean_pt1
+  ) %>%
+  # Rename columns with ARCS to same format
+  rename(
+    # 15 items analysis
+    ARCSMean15_pt1 = ARCS10itemMean_pt1,
+    ARCSMean15_pt2 = ARCS15itemMean_pt2,
+    ARCSMean15_pt3 = ARCS15itemMean_pt3,
+    ARCSMean15_pt4 = ARCS15itemMean_pt4,
+    # 10 items analysis
+    ARCSMean10_pt2 = arcs10_mean_pt2,
+    ARCSMean10_pt3 = arcs10_mean_pt3,
+    ARCSMean10_pt4 = arcs10_mean_pt4,
+  ) %>%
+  # Create ID column with numbers only
+  mutate(
+    ExternalReference = sub("^P002$", "P2", ExternalReference), # Correct error in labelling participant ID
+    ID = str_extract(ExternalReference, "\\d+") %>% as.numeric()
+  ) %>%
+  group_by(ID) %>%
+  summarise(
+    across(
+      everything(),
+      ~ {
+        if (is.character(.x)) {
+          x <- .x[!is.na(.x) & .x != ""]
+        } else {
+          x <- .x[!is.na(.x)]
+        }
+        if (length(x) == 0) NA else x[1]
+      }
+    ),
+    .groups = "drop"
+  ) %>%
+  # Put columns ending in timepoint in a unique column, and create
+  # a timepoint column for each value
+  pivot_longer(
+    cols = matches("_(ct|pt)[1-4]"),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  mutate(
+    tp = str_extract(name, "(ct|pt)[1-4]"),
+    timepoint = recode(
+      tp,
+      ct1 = "T1", pt1 = "T1",
+      ct2 = "T2", pt2 = "T2",
+      ct3 = "T3", pt3 = "T3",
+      ct4 = "T4", pt4 = "T4"
+    ),
+    variable = name %>%
+      str_remove("_(ct|pt)[1-4]") %>%
+      str_replace("__", "_") %>%
+      str_remove("_$")
+  ) %>%
+  select(ID, ExternalReference, Age, childsex, timepoint, variable, value) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = value
+  ) %>%
+  arrange(ID, timepoint)
+
+# Make timepoint ordered
+part_data_long <- part_data_long %>%
+  mutate(
+    timepoint = factor(timepoint, levels = c("T1", "T2", "T3", "T4"))
+  )
+```
+
+Filter IDs that are in the PA and sleep data.
+
+```{r otherfilter}
+part_data_long <- part_data_long %>% filter(ID %in% part5_meanmeas_derived2$ID) 
+```
+
+
+Summary table:
+
+```{r othersummary}
+st_options(footnote    = "Summary of variables in non-actigraphy data")
+for_summ_table <- part_data_long %>% dplyr::select(-ExternalReference, -ID, -timepoint)
+print(
+  dfSummary(for_summ_table, 
+          plain.ascii  = FALSE, 
+          style        = "grid", 
+          graph.col = FALSE, 
+          varnumbers   = FALSE,
+          valid.col    = FALSE,
+          headings = FALSE,
+          tmp.img.dir  = "/tmp"),
+  method = "render"
+)
+
+```
+
+
+# Sleep analysis
+
+We visually inspect trends in the sleep behaviour of the participants over time. 
+
+```{r generalsleep}
+# General sleep plot
+sleep_plot_df <- part5_meanmeas_derived2 %>%
+  dplyr::select(ID, timepoint, WASO, TST, SE) %>%
+  tidyr::pivot_longer(
+    cols = c(WASO, TST, SE),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+p_sleep <- ggplot(sleep_plot_df, aes(x = timepoint, y = value, group = ID)) +
+  geom_line(alpha = 0.15, colour = "blue") +
+  geom_point(alpha = 0.15, size = 1, colour = "blue") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.2, colour = "navy") +
+  stat_summary(aes(group = 1), fun = mean, geom = "point", size = 2, colour = "navy") +
+  stat_summary(aes(group = 1), fun.data = mean_se, geom = "errorbar", width = 0.1, colour = "navy") +
+  facet_wrap(
+    ~metric,
+    scales = "free_y",
+    labeller = as_labeller(c(
+      WASO = "Wake after sleep onset (WASO)",
+      TST = "Total sleep time (TST)",
+      SE = "Sleep efficiency (SE)"
+    ))
+  ) +
+  labs(
+    title = "Sleep over time",
+    x = "Timepoint",
+    y = "Observed value"
+  ) +
+  theme_minimal()
+p_sleep
+ggsave(p_sleep,filename = "plots_out/generalsleep.png", width = 10, height = 6)
+```
+
+
+And distributions/boxplots of each sleep variable
+
+```{r sleep_distributions}
+p_sleepdist <- ggplot(sleep_plot_df, aes(x = value)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "lightblue") +
+  geom_density(color = "darkblue", linewidth = 1) +
+  facet_wrap(
+    ~metric,
+    scales = "free",
+    labeller = as_labeller(c(
+      WASO = "Wake after sleep onset (WASO)",
+      TST = "Total sleep time (TST)",
+      SE = "Sleep efficiency (SE)"
+    ))
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of sleep parameters",
+    x = "Value",
+    y = "Density"
+  )
+p_sleepdist
+ggsave(p_sleepdist,filename = "plots_out/generalsleep_distribution.png", width = 10, height = 6)
+
+# Boxplots
+p_boxsleep <- ggplot(sleep_plot_df, aes(x = timepoint, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  facet_wrap(
+    ~metric,
+    scales = "free_y",
+    labeller = as_labeller(c(
+      WASO = "Wake after sleep onset (WASO)",
+      TST = "Total sleep time (TST)",
+      SE = "Sleep efficiency (SE)"
+    ))
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Sleep parameters by timepoint",
+    x = "Timepoint",
+    y = "Value"
+  )
+p_boxsleep
+ggsave(p_boxsleep,filename = "plots_out/generalsleep_boxplot.png", width = 10, height = 6)
+```
+
+A summary of the sleep variables per timepoint can also be obtained. 
+
+```{r sleep_sum}
+sleep_desc <- part5_meanmeas_derived2 %>%
+  dplyr::select(ID, timepoint, WASO, TST, SE) %>%
+  tidyr::pivot_longer(
+    cols = c(WASO, TST, SE),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  group_by(metric, timepoint) %>%
+  summarise(
+    n = n_distinct(ID),
+    mean = mean(value, na.rm = TRUE) %>% round(2),
+    sd = sd(value, na.rm = TRUE) %>% round(2),
+    median = median(value, na.rm = TRUE) %>% round(2),
+    .groups = "drop"
+  )
+
+sleep_desc %>% kable(
+  caption = "Summary of sleep variables",
+  col.names = c("Metric", "Timepoint", "N", "Mean", "SD", "Median")
+) %>% kable_styling()
+```
+
+Linear mixed-effects models can be used to examine whether sleep outcomes changed over time. Separate models are fitted for WASO, TST, and SE.
+
+**WASO**
+
+```{r sleep_timetest_waso}
+# Raw outcome
+waso_time.mod <- lmer(WASO ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(waso_time.mod) # Is there any effect of timepoint?
+emmeans(waso_time.mod, pairwise ~ timepoint) # Which timepoints differ from each other?
+
+# Sensitivity check
+waso_time.mod2 <- lmer(log(WASO) ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(waso_time.mod2) # Is there any effect of timepoint?
+emmeans(waso_time.mod2, pairwise ~ timepoint) # Which timepoints differ from each other?
+
+mod_names <- c("waso_time.mod", "waso_time.mod2")
+mod_perf_check(mod_names) 
+```
+
+Further outlier checks are carried out: 
+
+```{r sleep_timetest_waso_outliers, results = "hide"}
+data_no_out <- part5_meanmeas_derived2[-c(24, 44, 60, 66), ]
+mod_log_no_out <- lmer(log(WASO) ~ timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+**TST**
+
+```{r sleep_timetest_tst}
+tst_time.mod  <- lmer(TST  ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(tst_time.mod) # Is there any effect of timepoint?
+emmeans(tst_time.mod, pairwise ~ timepoint) # Which timepoints differ from each other?
+
+mod_names <- c("tst_time.mod")
+mod_perf_check(mod_names) 
+```
+
+```{r sleep_timetest_tst_sens, eval = FALSE, echo=FALSE}
+# Sensitivity check
+tst_time.mod2  <- lmer(log(TST)  ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(tst_time.mod2) # Is there any effect of timepoint?
+emmeans(tst_time.mod2, pairwise ~ timepoint) # Which timepoints differ from each other?
+mod_names <- c("tst_time.mod2")
+mod_perf_check(mod_names) 
+```
+
+Further outlier checks are carried out: 
+
+```{r sleep_timetest_tst_outliers, results = "hide"}
+data_no_out <- part5_meanmeas_derived2[-c(44, 66), ]
+mod_log_no_out <- lmer(TST  ~ timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+**SE**
+
+```{r sleep_timetest_se}
+se_time.mod   <- lmer(SE ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(se_time.mod) # Is there any effect of timepoint?
+emmeans(se_time.mod, pairwise ~ timepoint) # Which timepoints differ from each other?
+
+mod_names <- c("se_time.mod")
+mod_perf_check(mod_names)
+```
+
+```{r sleep_timetest_se_sens, eval = FALSE, echo=FALSE}
+# Sensitivity check
+se_time.mod2  <- lmer(qlogis(SE)  ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(se_time.mod2) # Is there any effect of timepoint?
+emmeans(se_time.mod2, pairwise ~ timepoint) # Which timepoints differ from each other?
+mod_names <- c("se_time.mod2")
+mod_perf_check(mod_names) 
+```
+
+Further outlier checks are carried out: 
+
+```{r sleep_timetest_se_outliers, results = "hide"}
+data_no_out <- part5_meanmeas_derived2[-c(24, 44, 60, 66), ]
+mod_log_no_out <- lmer(SE  ~ timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+*Note:* Initial models indicated some violations of model assumptions across sleep parameters. WASO showed substantial positive skewness and heteroscedasticity, with increasing variance at higher values; therefore, WASO was log-transformed prior to analysis. The transformed model demonstrated improved homogeneity of variance and more acceptable residual behaviour, although formal tests of normality remained significant, likely due to sample size. TST and SE exhibited moderate skewness and some evidence of heteroscedasticity; however, these patterns were relatively mild and consistent with the distributions of the variables (e.g., bounded nature of sleep efficiency and occasional short sleep duration). Possible transformations of these variables were explored, but they worsened the results. For the original models, diagnostic plots indicated that residual deviations were not severe, so both outcomes were analysed on the original scale. 
+Across all models, a small number of potentially influential observations were identified based on Cook’s distance. These corresponded to extreme but plausible sleep values and were consistent across outcomes. Sensitivity analyses excluding these cases yielded comparable results, with no meaningful changes in the direction, magnitude, or statistical significance of effects. Accordingly, all observations were retained.
+There was no evidence of a significant effect of timepoint on any of the sleep parameters (WASO, TST, or SE), and pairwise comparisons between timepoints were not statistically significant.
+
+# Physical activity analysis
+
+Physical activity trajectory plot
+
+```{r generalPA}
+pa_plot_df <- part5_meanmeas_derived2 %>%
+  dplyr::select(ID, timepoint, active_dur, mvpa_dur, dur_day_total_IN_min) %>%
+  tidyr::pivot_longer(
+    cols = c(active_dur, mvpa_dur, dur_day_total_IN_min),
+    names_to = "metric",
+    values_to = "value"
+  )
+p_pa <- ggplot(pa_plot_df, aes(x = timepoint, y = value, group = ID)) +
+  geom_line(alpha = 0.15, colour = "blue") +
+  geom_point(alpha = 0.15, size = 1, colour = "blue") +
+  stat_summary(
+    aes(group = 1),
+    fun = mean,
+    geom = "line",
+    linewidth = 1.2,
+    colour = "navy"
+  ) +
+  stat_summary(
+    aes(group = 1),
+    fun = mean,
+    geom = "point",
+    size = 2,
+    colour = "navy"
+  ) +
+  stat_summary(
+    aes(group = 1),
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.1,
+    colour = "navy"
+  ) +
+  facet_wrap(~metric, scales = "free_y",
+             labeller = as_labeller(c(
+               active_dur = "Activity duration",
+               mvpa_dur = "MVPA duration",
+               dur_day_total_IN_min = "Inactive duration"
+             ))) +
+  labs(
+    title = "Physical activity over time",
+    x = "Timepoint",
+    y = "Observed value"
+  ) +
+  theme_minimal()
+p_pa
+ggsave(p_pa,filename = "plots_out/PAgeneralwithse.png", width = 10, height = 6)
+```
+
+And distributions/boxplots of each sleep variable
+
+```{r pa_distributions}
+p_padist <- ggplot(pa_plot_df, aes(x = value)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "lightblue") +
+  geom_density(color = "darkblue", linewidth = 1) +
+  facet_wrap(
+    ~metric,
+    scales = "free",
+    labeller = as_labeller(c(
+      active_dur = "Activity duration",
+      mvpa_dur = "MVPA duration",
+      dur_day_total_IN_min = "Inactive duration"
+    ))
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of PA parameters",
+    x = "Value",
+    y = "Density"
+  )
+p_padist
+ggsave(p_padist,filename = "plots_out/generalpa_distribution.png", width = 10, height = 6)
+
+# Boxplots
+p_boxpa <- ggplot(pa_plot_df, aes(x = timepoint, y = value)) +
+  geom_boxplot(fill = "lightblue") +
+  facet_wrap(
+    ~metric,
+    scales = "free_y",
+    labeller = as_labeller(c(
+      active_dur = "Activity duration",
+      mvpa_dur = "MVPA duration",
+      dur_day_total_IN_min = "Inactive duration"
+    ))
+  ) +
+  theme_minimal() +
+  labs(
+    title = "PA parameters by timepoint",
+    x = "Timepoint",
+    y = "Value"
+  )
+p_boxpa
+ggsave(p_boxpa,filename = "plots_out/generalpa_boxplot.png", width = 10, height = 6)
+```
+
+
+A summary of the sleep variables per timepoint can be obtained. 
+
+```{r pa_sum}
+pa_desc <- part5_meanmeas_derived2 %>%
+  dplyr::select(ID, timepoint, active_dur, mvpa_dur, dur_day_total_IN_min) %>%
+  tidyr::pivot_longer(
+    cols = c(active_dur, mvpa_dur, dur_day_total_IN_min),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  group_by(metric, timepoint) %>%
+  summarise(
+    n = n_distinct(ID),
+    mean = mean(value, na.rm = TRUE) %>% round(2),
+    sd = sd(value, na.rm = TRUE) %>% round(2),
+    median = median(value, na.rm = TRUE) %>% round(2),
+    .groups = "drop"
+  )
+
+pa_desc %>% kable(
+  caption = "Summary of PA variables",
+  col.names = c("Metric", "Timepoint", "N", "Mean", "SD", "Median")
+) %>% kable_styling()
+```
+
+Linear mixed-effects models can be used to examine whether sleep outcomes changed over time. Separate models are fitted for activity duration, MVPA, inactivity duration, with timepoint as a fixed effect and participant ID as a random intercept.
+
+**Active duration**
+
+```{r pa_timetest_active}
+active_time.mod <- lmer(active_dur ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+
+anova(active_time.mod) 
+emmeans(active_time.mod, pairwise ~ timepoint)
+
+mod_names <- c("active_time.mod")
+mod_perf_check(mod_names) 
+```
+
+Further outlier checks are carried out: 
+
+```{r pa_timetest_active_outliers, results = "hide"}
+data_no_out <- part5_meanmeas_derived2[-c(159, 169), ]
+mod_log_no_out <- lmer(active_dur  ~ timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+**MVPA**
+
+```{r pa_timetest_mvpa}
+mvpa_time.mod  <- lmer(mvpa_dur  ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(mvpa_time.mod) 
+emmeans(mvpa_time.mod, pairwise ~ timepoint)
+
+mod_names <- c("mvpa_time.mod")
+mod_perf_check(mod_names) 
+```
+
+Further outlier checks are carried out: 
+
+```{r pa_timetest_mvpa_outliers, results = "hide"}
+data_no_out <- part5_meanmeas_derived2[-c(74, 128, 151, 175), ]
+mod_log_no_out <- lmer(mvpa_dur  ~ timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+**Inactive duration**
+
+```{r pa_timetest_inactive}
+inact_time.mod   <- lmer(dur_day_total_IN_min   ~ timepoint + (1 | ID), data = part5_meanmeas_derived2)
+anova(inact_time.mod) 
+emmeans(inact_time.mod, pairwise ~ timepoint)
+
+mod_names <- c("inact_time.mod")
+mod_perf_check(mod_names) 
+```
+
+Further outlier checks are carried out: 
+
+```{r pa_timetest_inactive_outliers, results = "hide"}
+data_no_out <- part5_meanmeas_derived2[-c(37, 145, 146, 169, 171), ]
+mod_log_no_out <- lmer(dur_day_total_IN_min  ~ timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+*Note:* Model diagnostics indicated some heteroscedasticity across outcomes; however, visual inspection of residual plots suggested that these deviations were relatively mild and did not substantially impact model fit or inference. Sensitivity analyses excluding influential observations yielded comparable results, and all observations were retained. There was a significant effect of timepoint on all outcomes. Total daily inactivity was significantly lower at T2 and T3 compared to baseline (T1), while the reduction at T4 did not remain statistically significant after adjustment. Pairwise comparisons indicated no significant differences between follow-up timepoints. In contrast, MVPA and total active time were significantly higher at all follow-up timepoints compared to baseline (all p ≤ .001), with no significant differences observed between T2, T3, and T4. Overall, these findings indicate a consistent pattern of reduced inactivity and increased physical activity from baseline, with improvements largely maintained across follow-up assessments.
+
+**Improvement by T2**
+
+Check improving physical activity, that is, someone improves if the second timepoint available for that person is higher (MVPA, active duration) or lower (inactivity) than the first timepoint available.
+
+```{r PAimprovement}
+improve_df <- part5_meanmeas_derived2 %>%
+  pivot_longer(
+    cols = c(dur_day_total_IN_min, active_dur, mvpa_dur),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  group_by(ID, metric) %>%
+  arrange(timepoint, .by_group = TRUE) %>%
+  summarise(
+    improved = case_when(
+      first(metric) == "dur_day_total_IN_min" ~ nth(value, 2) < nth(value, 1),
+      TRUE ~ nth(value, 2) > nth(value, 1)
+    ),
+    .groups = "drop"
+  )
+
+p_impr <- ggplot(improve_df, aes(x = metric, fill = improved)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(
+    name = "Change status",
+    values = c("TRUE" = "forestgreen", "FALSE" = "firebrick"),
+    labels = c("TRUE" = "Improved", "FALSE" = "Did not improve")
+  ) +
+  scale_x_discrete(labels = c(
+    dur_day_total_IN_min = "Inactivity",
+    active_dur = "Active duration",
+    mvpa_dur = "MVPA duration"
+  )) +
+  labs(
+    title = "Number of participants who improved by metric",
+    x = "Metric",
+    y = "Number of participants"
+  ) +
+  theme_minimal()
+
+p_impr
+ggsave(p_impr,filename = "plots_out/meanPAimprovement.png", width = 10, height = 6)
+```
+
+```{r PAimprovement_table}
+improve_table_wide_pct <- improve_df %>%
+  mutate(
+    change_status = if_else(improved, "Improved", "Did not improve"),
+    metric_label = recode(
+      metric,
+      dur_day_total_IN_min = "Inactivity",
+      active_dur = "Active duration",
+      mvpa_dur = "MVPA duration"
+    )
+  ) %>%
+  count(metric_label, change_status, name = "n_people") %>%
+  group_by(metric_label) %>%
+  mutate(
+    percent = round(100 * n_people / sum(n_people), 1),
+    value = paste0(n_people, " (", percent, "%)")
+  ) %>%
+  select(metric_label, change_status, value) %>%
+  tidyr::pivot_wider(
+    names_from = change_status,
+    values_from = value,
+    values_fill = "0 (0%)"
+  ) %>%
+  ungroup()
+
+improve_table_wide_pct %>% kable(
+  caption = "Improving physical activity",
+  col.names = c("Measurement", "Did not improve", "Improved")
+) %>% kable_styling()
+```
+
+
+# Other participant data
+
+## Age and sex
+
+```{r otherplot}
+# Age and sex plots
+baseline_df <- part_data_long %>%
+  distinct(ID, Age, childsex) %>%
+  mutate(
+    childsex = factor(childsex, levels = c(1, 2), labels = c("Male", "Female")),
+    Age = as.numeric(Age)
+    )
+
+p_age <- ggplot(baseline_df, aes(x = Age)) +
+  geom_histogram(
+    fill = "navy",
+    colour = "grey"
+  ) +
+  labs(
+    title = "Age distribution",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
+p_age
+ggsave(p_age,filename = "plots_out/agedistribution.png", width = 10, height = 6)
+
+p_sex <- baseline_df %>%
+  dplyr::filter(!is.na(childsex)) %>%
+  ggplot(aes(x = factor(childsex))) +
+  geom_bar(colour = "grey", fill = "navy") +
+  theme_minimal() +
+  labs(title = "Sex distribution",
+  x = "Sex", y  = "Count")
+p_sex
+ggsave(p_sex,filename = "plots_out/sexdistribution.png", width = 10, height = 6)
+```
+
+## Other variables
+
+```{r otherplot2}
+plot_df <- part_data_long %>%
+  pivot_longer(
+    cols = c(ARCSMean15, ARCSMean10, avpain, Depression_Tscore, Anxiety_Tscore),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+p_otherv <- ggplot(plot_df, aes(x = timepoint, y = value, group = ID)) +
+  geom_line(alpha = 0.15, colour = "blue") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.2,colour = "navy") +
+  stat_summary(aes(group = 1), fun = mean, geom = "point", size = 2,colour = "navy") +
+  stat_summary(aes(group = 1), fun.data = mean_se, geom = "errorbar", width = 0.1) +
+  facet_wrap(~ variable, scales = "free_y",
+             labeller = as_labeller(c(
+               ARCSMean15 = "ARCS15",
+               ARCSMean10 = "ARCS10",
+               avpain = "Average pain",
+               Depression_Tscore = "Depression score",
+               Anxiety_Tscore = "Anxiety score"
+             ))
+  ) +
+  labs(
+    x = "Timepoint",
+    y = "Score",
+    title = "Individual trajectories over time"
+  ) +
+  theme_minimal()
+p_otherv
+ggsave(p_otherv,filename = "plots_out/othervariablestraject.png", width = 14, height = 10)
+```
+
+
+# Correlation between variables 
+
+Merge both datasets
+
+```{r mergedat}
+full_dat <- left_join(part5_meanmeas_derived2, part_data_long, by = c("ID", "timepoint"))
+```
+
+Check correlations
+
+```{r corr}
+cor_mat <- full_dat %>% 
+  dplyr::select(
+    TST, SE, WASO, dur_day_total_IN_min, active_dur, mvpa_dur, dur_day_total_LIG_min,
+    avpain, Depression_Tscore, Anxiety_Tscore, ARCSMean15
+  ) %>% 
+  cor(use = "pairwise.complete.obs")
+colnames(cor_mat) <- c("TST", "SE", "WASO","Inactive duration","Active duration", "MVPA","Light activity duration",
+                       "Avg pain", "Depression","Anxiety", "Protectiveness")
+rownames(cor_mat) <- c("TST", "SE", "WASO","Inactive duration","Active duration", "MVPA","Light activity duration",
+                       "Avg pain", "Depression","Anxiety", "Protectiveness")
+cor_mat %>% kable( caption = "Correlation matrix") %>% kable_styling()
+```
+
+
+```{r corr2, fig.height= 10, fig.width= 10}
+corrplot(cor_mat, type = "upper", addCoef.col = "black", tl.col = "black")
+```
+
+
+Pairs plot
+
+```{r pairsplot, fig.height= 8, fig.width= 10}
+pair_df <- full_dat %>% dplyr::select(
+  TST, SE, WASO, dur_day_total_IN_min, active_dur, mvpa_dur, dur_day_total_LIG_min,
+  avpain, Depression_Tscore, Anxiety_Tscore, ARCSMean15
+)
+pairs(pair_df)
+```
+
+
+# Sleep and PA relationship
+
+## WASO
+
+```{r waso}
+wasoact.mod <- lmer(
+  WASO ~ mvpa_dur + dur_day_total_IN_min + dur_day_total_LIG_min + timepoint + (1 | ID),
+  data = full_dat
+)
+# model summary
+wasoact.sum <- summary(wasoact.mod)
+capture.output(print(wasoact.sum), file = "mod_summaries/H2_activity_and_waso.txt")
+
+# Sensitivity check
+wasoact.mod2 <- lmer(
+  log(WASO) ~ mvpa_dur + dur_day_total_IN_min + dur_day_total_LIG_min + timepoint + (1 | ID),
+  data = full_dat
+)
+# model summary
+wasoact.sum2 <- summary(wasoact.mod2)
+capture.output(print(wasoact.sum2), file = "mod_summaries/H2_activity_and_waso2.txt")
+
+mod_names <- c("wasoact.mod", "wasoact.mod2")
+mod_perf_check(mod_names) 
+```
+
+
+## TST
+
+```{r tst}
+tstact.mod <- lmer(
+  TST ~ mvpa_dur + dur_day_total_IN_min + dur_day_total_LIG_min + timepoint + (1 | ID),
+  data = full_dat
+)
+
+# model summary
+tstact.sum <- summary(tstact.mod)
+capture.output(print(tstact.sum), file = "mod_summaries/H2_activity_and_tst.txt")
+
+mod_names <- c("tstact.mod")
+mod_perf_check(mod_names) 
+```
+
+
+```{r tstpa_outliers, results = "hide"}
+# Further outlier checks
+data_no_out <- full_dat[-c(44), ]
+mod_log_no_out <- lmer(TST ~ mvpa_dur + dur_day_total_IN_min + dur_day_total_LIG_min + timepoint + (1 | ID), data = data_no_out)
+summary(mod_log_no_out)
+```
+
+
+## SE
+
+```{r se}
+seact.mod <- lmer(
+  SE ~ mvpa_dur + dur_day_total_IN_min + dur_day_total_LIG_min + timepoint + (1 | ID),
+  data = full_dat
+)
+
+# model summary
+seact.sum <- summary(seact.mod)
+capture.output(print(seact.sum), file = "mod_summaries/H2_activity_and_se.txt")
+
+mod_names <- c("seact.mod")
+mod_perf_check(mod_names) 
+```
+
+## Table of results
+
+```{r sleeppa_restable}
+# waso_tab <- tidy(wasoact.mod, effects = "fixed", conf.int = TRUE) %>%
+#   mutate(outcome = "WASO")
+
+waso_tab <- tidy(wasoact.mod2, effects = "fixed", conf.int = TRUE) %>%
+  mutate(
+    outcome = "WASO",
+    estimate = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  )
+
+tst_tab <- tidy(tstact.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(outcome = "TST")
+se_tab <- tidy(seact.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(outcome = "SE")
+model_results <- bind_rows(waso_tab, tst_tab, se_tab)
+model_results_clean <- model_results %>%
+  select(
+    outcome,
+    term,
+    estimate,
+    conf.low,
+    conf.high,
+    p.value
+  )
+
+# model_results_clean <- model_results %>%
+#   mutate(
+#     term = recode(
+#       term,
+#       `(Intercept)` = "Intercept",
+#       mvpa_dur = "MVPA duration",
+#       dur_day_total_IN_min = "Inactive duration",
+#       dur_day_total_LIG_min = "Light activity duration",
+#       timepointT2 = "Timepoint: T2",
+#       timepointT3 = "Timepoint: T3",
+#       timepointT4 = "Timepoint: T4"
+#     ),
+#     result = paste0(
+#       round(estimate, 3),
+#       " [",
+#       round(conf.low, 3),
+#       ", ",
+#       round(conf.high, 3),
+#       "], p = ",
+#       format.pval(p.value, digits = 3, eps = .001)
+#     )
+#   ) %>%
+#   select(outcome, term, result)
+
+model_results_clean <- model_results %>%
+  mutate(
+    term = recode(
+      term,
+      `(Intercept)` = "Intercept",
+      mvpa_dur = "MVPA duration",
+      dur_day_total_IN_min = "Inactive duration",
+      dur_day_total_LIG_min = "Light activity duration",
+      timepointT2 = "Timepoint: T2",
+      timepointT3 = "Timepoint: T3",
+      timepointT4 = "Timepoint: T4"
+    ),
+    result = case_when(
+      outcome == "WASO" ~ paste0(
+        round((estimate - 1) * 100, 1), "% [",
+        round((conf.low - 1) * 100, 1), ", ",
+        round((conf.high - 1) * 100, 1), "], p = ",
+        format.pval(p.value, digits = 3, eps = .001)
+      ),
+      TRUE ~ paste0(
+        round(estimate, 3),
+        " [",
+        round(conf.low, 3),
+        ", ",
+        round(conf.high, 3),
+        "], p = ",
+        format.pval(p.value, digits = 3, eps = .001)
+      )
+    )
+  ) %>%
+  select(outcome, term, result)
+
+
+model_results_clean <- model_results_clean %>%
+  filter(term != "Intercept")
+
+
+model_results_wide <- model_results_clean %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = result
+  )
+
+
+model_results_wide %>% kable(
+  caption = "Linear mixed-effects models predicting sleep outcomes from physical activity variables.", 
+  col.names = c("Term", "WASO", "TST", "SE")
+  ) %>% kable_styling() %>%
+   add_footnote("Note. WASO coefficients are presented as percentage change due to log transformation; other outcomes are unstandardised coefficients. Each model included a random intercept for participant ID. T1 was the reference timepoint. CI = 95% confidence interval.", notation="alphabet")
+write.csv(model_results_wide, "mod_summaries/pa_sleep_tableresults.csv", row.names = FALSE)
+```
+
+
+Forest plots
+
+```{r forestpasleep}
+# Tidy fixed effects from each model
+# tab_waso <- tidy(wasoact.mod, effects = "fixed", conf.int = TRUE) %>%
+#   mutate(outcome = "WASO")
+
+tab_waso <- tidy(wasoact.mod2, effects = "fixed", conf.int = TRUE) %>%
+  mutate(
+    outcome = "WASO",
+    estimate = 100 * (exp(estimate) - 1),
+    conf.low = 100 * (exp(conf.low) - 1),
+    conf.high = 100 * (exp(conf.high) - 1),
+    scale = "percent change"
+  )
+
+tab_se <- tidy(seact.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(outcome = "SE")
+
+tab_tst <- tidy(tstact.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(outcome = "TST")
+
+# Combine and keep only the activity predictors
+plot_dat <- bind_rows(tab_waso, tab_se, tab_tst) %>%
+  filter(term %in% c("dur_day_total_IN_min", "dur_day_total_LIG_min", "mvpa_dur")) %>%
+  mutate(
+    term = recode(term,
+                  dur_day_total_IN_min = "Inactive time",
+                  dur_day_total_LIG_min = "Light activity",
+                  mvpa_dur = "MVPA"
+    ),
+    term = factor(term, levels = c("Inactive time", "Light activity", "MVPA"))
+  )
+
+# Forest plot
+pforest <- ggplot(plot_dat, aes(x = estimate, y = fct_rev(term))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ outcome, scales = "free_x") +
+  labs(
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    title = "Associations between activity measures and sleep outcomes"
+  ) +
+  theme_bw(base_size = 12)
+pforest
+ggsave(pforest,filename = "plots_out/sleeppa_forest.png", width = 10, height = 6)
+```
+
+# PA and pain, depressive symptoms, parent protectiveness 
+
+## ARCS 15 items
+
+Activity duration
+
+```{r arcs15_acti}
+# Activity duration
+actiother15.mod <- lmer(
+  active_dur ~ avpain + Depression_Tscore + ARCSMean15 + timepoint + (1|ID),
+  data = full_dat
+)
+actiother15.sum <- summary(actiother15.mod)
+capture.output(print(actiother15.sum), file = "mod_summaries/H3_activity_and_otherARCS15.txt")
+
+mod_names <- c("actiother15.mod")
+mod_perf_check(mod_names) 
+```
+
+Inactivity duration
+
+```{r arcs15_inacti}
+# Inactivity duration
+inactiother15.mod <- lmer(
+  dur_day_total_IN_min ~ avpain + Depression_Tscore + ARCSMean15 + timepoint + (1|ID),
+  data = full_dat
+)
+inactiother15.sum <- summary(inactiother15.mod)
+capture.output(print(inactiother15.sum), file = "mod_summaries/H3_inactivity_and_otherARCS15.txt")
+
+mod_names <- c("inactiother15.mod")
+mod_perf_check(mod_names) 
+```
+
+
+MVPA duration
+
+```{r arcs15_mvpa}
+# MVPA
+mvpaother15.mod <- lmer(
+  mvpa_dur ~ avpain + Depression_Tscore + ARCSMean15 + timepoint + (1|ID),
+  data = full_dat
+)
+
+mvpaother15.sum <- summary(mvpaother15.mod)
+capture.output(print(mvpaother15.sum), file = "mod_summaries/H3_mvpa_and_otherARCS15.txt")
+
+mod_names <- c("mvpaother15.mod")
+mod_perf_check(mod_names)
+```
+
+```{r arcs_restable}
+actdur_tab <- tidy(
+  actiother15.mod,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+) %>%
+  mutate(outcome = "Active duration")
+inactdur_tab <- tidy(
+  inactiother15.mod,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+) %>%
+  mutate(outcome = "Inactive duration")
+mvpa_tab <- tidy(
+  mvpaother15.mod,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+) %>%
+  mutate(outcome = "MVPA duration")
+activity_results <- bind_rows(
+  actdur_tab,
+  inactdur_tab,
+  mvpa_tab
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(
+      term,
+      avpain = "Pain",
+      Depression_Tscore = "Depressive symptoms",
+      ARCSMean15 = "Parent protectiveness",
+      timepointT2 = "Timepoint: T2",
+      timepointT3 = "Timepoint: T3",
+      timepointT4 = "Timepoint: T4"
+    ),
+    result = paste0(
+      round(estimate, 2),
+      " [",
+      round(conf.low, 2),
+      ", ",
+      round(conf.high, 2),
+      "], p = ",
+      format.pval(p.value, digits = 3, eps = .001)
+    )
+  ) %>%
+  select(term, outcome, result) %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = result
+  )
+
+activity_results %>% kable(
+  caption = "Linear mixed-effects models predicting physical activity outcomes from pain, depressive symptoms, and parent protectiveness.", 
+  col.names = c("Term", "Active duration", "Inactive duration", "MVPA duration")
+  ) %>% kable_styling() %>%
+   add_footnote("Note. Values are unstandardised coefficients with Wald 95% confidence intervals and p-values from linear mixed-effects models. Each model included a random intercept for participant ID. T1 was the reference timepoint. MVPA = moderate-to-vigorous physical activity. CI = confidence interval.", notation="alphabet")
+write.csv(activity_results, "mod_summaries/pa_depressionprotect_tableresults.csv", row.names = FALSE)
+```
+
+
+## ARCS 10 items (sensitivity analysis)
+
+### Activity duration
+
+```{r arcs10_acti}
+# Activity duration
+actiother10.mod <- lmer(
+  active_dur ~ avpain + Depression_Tscore + ARCSMean10 + timepoint + (1|ID),
+  data = full_dat
+)
+
+actiother10.sum <- summary(actiother10.mod)
+# actiother10.sum
+capture.output(print(actiother10.sum), file = "mod_summaries/H3_activity_and_otherARCS10.txt")
+
+mod_names <- c("actiother10.mod")
+mod_perf_check(mod_names)
+```
+
+Comparison with ARCS 15 items
+
+```{r comparison_acti}
+tab_10 <- broom.mixed::tidy(actiother10.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean10 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    estimate_10 = estimate,
+    conf.low_10 = conf.low,
+    conf.high_10 = conf.high,
+    p_10 = p.value
+  )
+
+tab_15 <- broom.mixed::tidy(actiother15.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean15 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    estimate_15 = estimate,
+    conf.low_15 = conf.low,
+    conf.high_15 = conf.high,
+    p_15 = p.value
+  )
+
+compare_tab <- full_join(tab_15, tab_10, by = "term")
+compare_tab <- compare_tab %>%
+  mutate(
+    across(starts_with("estimate"), ~ round(.x, 2)),
+    across(starts_with("conf.low"), ~ round(.x, 2)),
+    across(starts_with("conf.high"), ~ round(.x, 2)),
+    across(starts_with("p_"), ~ round(.x, 3))
+  )
+
+compare_tab %>% kable(
+  caption = "Comparison between results using ARCS with 15 and 10 items", 
+  col.names = c("Term", "Estimate (15-item)", "CI low (15-item)", "CI high (15-item)", "p (15-item)", "Estimate (10-item)", "CI low (10-item)", "CI high (10-item)", "p (10-item)")
+) %>% kable_styling()
+
+
+write.csv(compare_tab, file= "mod_summaries/activityARCS1015comp.csv", row.names = FALSE)
+
+
+plot_10 <- broom.mixed::tidy(actiother15.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "ARCS-10")
+
+plot_15 <- broom.mixed::tidy(actiother10.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "ARCS-15")
+
+plot_dat <- bind_rows(plot_10, plot_15) %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean10 = "ARCS score",
+                  ARCSMean15 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    ),
+    term = factor(term, levels = c(
+      "Average pain", "Depression", "ARCS score",
+      "Timepoint T2", "Timepoint T3", "Timepoint T4"
+    ))
+  )
+
+pactiARCS <- ggplot(plot_dat, aes(x = estimate, y = fct_rev(term), shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2,
+                 position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  labs(
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    title = "Sensitivity analysis: ARCS-15 vs ARCS-10"
+  ) +
+  theme_bw()
+pactiARCS
+ggsave(pactiARCS,filename = "plots_out/actiARCScomparison.png", width = 10, height = 6)
+```
+
+
+### Inactivity duration
+
+```{r arcs10_inacti}
+# Inactivity duration
+inactiother10.mod <- lmer(
+  dur_day_total_IN_min ~ avpain + Depression_Tscore + ARCSMean10 + timepoint + (1|ID),
+  data = full_dat
+)
+
+inactiother10.sum <- summary(inactiother10.mod)
+# inactiother10.sum
+capture.output(print(inactiother10.sum), file = "mod_summaries/H3_inactivity_and_otherARCS10.txt")
+
+mod_names <- c("inactiother10.mod")
+mod_perf_check(mod_names)
+```
+
+Comparison with ARCS 15 items
+
+
+```{r comparison_inacti}
+# === comparison INACTIVITY
+tab_10 <- broom.mixed::tidy(inactiother10.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean10 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    estimate_10 = estimate,
+    conf.low_10 = conf.low,
+    conf.high_10 = conf.high,
+    p_10 = p.value
+  )
+
+tab_15 <- broom.mixed::tidy(inactiother15.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean15 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    estimate_15 = estimate,
+    conf.low_15 = conf.low,
+    conf.high_15 = conf.high,
+    p_15 = p.value
+  )
+
+compare_tab <- full_join(tab_15, tab_10, by = "term")
+compare_tab <- compare_tab %>%
+  mutate(
+    across(starts_with("estimate"), ~ round(.x, 2)),
+    across(starts_with("conf.low"), ~ round(.x, 2)),
+    across(starts_with("conf.high"), ~ round(.x, 2)),
+    across(starts_with("p_"), ~ round(.x, 3))
+  )
+
+compare_tab %>% kable(
+  caption = "Comparison between results using ARCS with 15 and 10 items", 
+  col.names = c("Term", "Estimate (15-item)", "CI low (15-item)", "CI high (15-item)", "p (15-item)", "Estimate (10-item)", "CI low (10-item)", "CI high (10-item)", "p (10-item)")
+) %>% kable_styling()
+
+write.csv(compare_tab, file= "mod_summaries/inactivityARCS1015comp.csv", row.names = FALSE)
+
+
+plot_10 <- broom.mixed::tidy(inactiother15.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "ARCS-10")
+
+plot_15 <- broom.mixed::tidy(inactiother10.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "ARCS-15")
+
+plot_dat <- bind_rows(plot_10, plot_15) %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean10 = "ARCS score",
+                  ARCSMean15 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    ),
+    term = factor(term, levels = c(
+      "Average pain", "Depression", "ARCS score",
+      "Timepoint T2", "Timepoint T3", "Timepoint T4"
+    ))
+  )
+
+pinactiARCS <- ggplot(plot_dat, aes(x = estimate, y = fct_rev(term), shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2,
+                 position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  labs(
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    title = "Sensitivity analysis: ARCS-15 vs ARCS-10"
+  ) +
+  theme_bw()
+pinactiARCS
+ggsave(pinactiARCS,filename = "plots_out/inactiARCScomparison.png", width = 10, height = 6)
+```
+
+
+### MVPA duration
+
+```{r arcs10_mvpa}
+# MVPA
+mvpaother10.mod <- lmer(
+  mvpa_dur ~ avpain + Depression_Tscore + ARCSMean10 + timepoint + (1|ID),
+  data = full_dat
+)
+
+mvpaother10.sum <- summary(mvpaother10.mod)
+# mvpaother10.sum
+capture.output(print(mvpaother10.sum), file = "mod_summaries/H3_mvpa_and_otherARCS10.txt")
+
+mod_names <- c("mvpaother10.mod")
+mod_perf_check(mod_names)
+```
+
+Comparison with ARCS 15 items
+
+```{r comparison_mvpa}
+tab_10 <- broom.mixed::tidy(mvpaother10.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean10 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    estimate_10 = estimate,
+    conf.low_10 = conf.low,
+    conf.high_10 = conf.high,
+    p_10 = p.value
+  )
+
+tab_15 <- broom.mixed::tidy(mvpaother15.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean15 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    )
+  ) %>%
+  dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(
+    estimate_15 = estimate,
+    conf.low_15 = conf.low,
+    conf.high_15 = conf.high,
+    p_15 = p.value
+  )
+
+compare_tab <- full_join(tab_15, tab_10, by = "term")
+compare_tab <- compare_tab %>%
+  mutate(
+    across(starts_with("estimate"), ~ round(.x, 2)),
+    across(starts_with("conf.low"), ~ round(.x, 2)),
+    across(starts_with("conf.high"), ~ round(.x, 2)),
+    across(starts_with("p_"), ~ round(.x, 3))
+  )
+
+compare_tab %>% kable(
+  caption = "Comparison between results using ARCS with 15 and 10 items", 
+  col.names = c("Term", "Estimate (15-item)", "CI low (15-item)", "CI high (15-item)", "p (15-item)", "Estimate (10-item)", "CI low (10-item)", "CI high (10-item)", "p (10-item)")
+) %>% kable_styling()
+
+write.csv(compare_tab, file= "mod_summaries/mvpaARCS1015comp.csv", row.names = FALSE)
+
+
+plot_10 <- broom.mixed::tidy(mvpaother15.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "ARCS-10")
+
+plot_15 <- broom.mixed::tidy(mvpaother10.mod, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "ARCS-15")
+
+plot_dat <- bind_rows(plot_10, plot_15) %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  ARCSMean10 = "ARCS score",
+                  ARCSMean15 = "ARCS score",
+                  timepointT2 = "Timepoint T2",
+                  timepointT3 = "Timepoint T3",
+                  timepointT4 = "Timepoint T4"
+    ),
+    term = factor(term, levels = c(
+      "Average pain", "Depression", "ARCS score",
+      "Timepoint T2", "Timepoint T3", "Timepoint T4"
+    ))
+  )
+
+pmvpaARCS <- ggplot(plot_dat, aes(x = estimate, y = fct_rev(term), shape = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2,
+                 position = position_dodge(width = 0.5)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  labs(
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    title = "Sensitivity analysis: ARCS-15 vs ARCS-10"
+  ) +
+  theme_bw()
+pmvpaARCS
+ggsave(pmvpaARCS,filename = "plots_out/mvpaARCScomparison.png", width = 10, height = 6)
+
+
+```
+
+*Note:* Residual diagnostics suggested approximate normality, with only mild heteroscedasticity observed and no influential outliers detected.
+
+# Sleep and pain, depression, anxiety
+
+## WASO
+
+```{r waso2}
+wasoother.mod <- lmer(
+  WASO ~ avpain + Depression_Tscore + Anxiety_Tscore + timepoint + (1|ID),
+  data = full_dat
+)
+# Model summary
+wasoother.sum <- summary(wasoother.mod)
+capture.output(print(wasoother.sum), file = "mod_summaries/H4_waso_and_other.txt")
+
+# Sensitivity check
+wasoother.mod2 <- lmer(
+  log(WASO) ~ avpain + Depression_Tscore + Anxiety_Tscore + timepoint + (1|ID),
+  data = full_dat
+)
+# Model summary
+wasoother.sum2 <- summary(wasoother.mod2)
+capture.output(print(wasoother.sum2), file = "mod_summaries/H4_waso_and_other2.txt")
+
+mod_names <- c("wasoother.mod", "wasoother.mod2")
+mod_perf_check(mod_names)
+```
+
+## TST
+
+```{r tst2}
+tstother.mod <- lmer(
+  TST ~ avpain + Depression_Tscore + Anxiety_Tscore + timepoint + (1|ID),
+  data = full_dat
+)
+# Model summary
+tstother.sum <- summary(tstother.mod)
+capture.output(print(tstother.sum), file = "mod_summaries/H4_tst_and_other.txt")
+
+mod_names <- c("tstother.mod")
+mod_perf_check(mod_names)
+```
+
+
+## SE
+
+```{r se2}
+seother.mod <- lmer(
+  SE ~ avpain + Depression_Tscore + Anxiety_Tscore + timepoint + (1|ID),
+  data = full_dat
+)
+# Model summary
+seother.sum <- summary(seother.mod)
+capture.output(print(seother.sum), file = "mod_summaries/H4_se_and_other.txt")
+
+mod_names <- c("seother.mod")
+mod_perf_check(mod_names)
+```
+
+## Table of results
+
+```{r results_tableH4}
+# waso_sleep_tab <- tidy(wasoother.mod, effects = "fixed", conf.int = TRUE) %>%
+  # mutate(outcome = "WASO")
+
+waso_sleep_tab <- tidy(wasoother.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(
+    outcome = "WASO",
+    estimate = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  )
+
+tst_sleep_tab <- tidy(
+  tstother.mod,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+) %>%
+  mutate(outcome = "TST")
+
+se_sleep_tab <- tidy(
+  seother.mod,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+) %>%
+  mutate(outcome = "SE")
+
+sleep_symptom_results <- bind_rows(
+  waso_sleep_tab,
+  tst_sleep_tab,
+  se_sleep_tab
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(
+      term,
+      `(Intercept)` = "Intercept",
+      avpain = "Average pain",
+      Depression_Tscore = "Depressive symptoms",
+      Anxiety_Tscore = "Anxiety symptoms",
+      timepointT2 = "Timepoint: T2",
+      timepointT3 = "Timepoint: T3",
+      timepointT4 = "Timepoint: T4"
+    ),
+    result = case_when(
+      outcome == "WASO" ~ paste0(
+        round((estimate - 1) * 100, 1), "% [",
+        round((conf.low - 1) * 100, 1), ", ",
+        round((conf.high - 1) * 100, 1), "], p = ",
+        format.pval(p.value, digits = 3, eps = .001)
+      ),
+      TRUE ~ paste0(
+        round(estimate, 3),
+        " [",
+        round(conf.low, 3),
+        ", ",
+        round(conf.high, 3),
+        "], p = ",
+        format.pval(p.value, digits = 3, eps = .001)
+      )
+    )
+  ) %>%
+  select(term, outcome, result) %>%
+  filter(term != "Intercept") %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = result
+  )
+
+sleep_symptom_results %>% kable(
+  caption = "Linear mixed-effects models predicting sleep outcomes from pain, depressive symptoms, and anxiety symptoms.", 
+  col.names = c("Term", "WASO", "TST", "SE")
+  ) %>% kable_styling() %>%
+   add_footnote("Note. WASO coefficients are presented as percentage change due to log transformation; other outcomes are unstandardised coefficients. Each model included a random intercept for participant ID. T1 was the reference timepoint. CI = confidence interval.", notation="alphabet")
+write.csv(sleep_symptom_results, "mod_summaries/sleepothervars_tableresults.csv", row.names = FALSE)
+```
+
+
+Forest plots
+
+```{r forestsleepother}
+# Tidy fixed effects from each model
+# tab_waso <- tidy(wasoother.mod, effects = "fixed", conf.int = TRUE) %>%
+#   mutate(outcome = "WASO")
+
+tab_waso <- tidy(wasoother.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(
+    outcome = "WASO",
+    estimate = 100 * (exp(estimate) - 1),
+    conf.low = 100 * (exp(conf.low) - 1),
+    conf.high = 100 * (exp(conf.high) - 1),
+    scale = "percent change"
+  )
+
+tab_se <- tidy(seother.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(outcome = "SE")
+
+tab_tst <- tidy(tstother.mod, effects = "fixed", conf.int = TRUE) %>%
+  mutate(outcome = "TST")
+
+# Combine and keep only the activity predictors
+plot_dat <- bind_rows(tab_waso, tab_se, tab_tst) %>%
+  filter(term %in% c("avpain", "Depression_Tscore", "Anxiety_Tscore")) %>%
+  mutate(
+    term = recode(term,
+                  avpain = "Average pain",
+                  Depression_Tscore = "Depression",
+                  Anxiety_Tscore = "Anxiety"
+    ),
+    term = factor(term, levels = c("Average pain", "Depression", "Anxiety"))
+  )
+
+# Forest plot
+pforest <- ggplot(plot_dat, aes(x = estimate, y = fct_rev(term))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ outcome, scales = "free_x") +
+  labs(
+    x = "Coefficient estimate (95% CI)",
+    y = NULL,
+    title = "Associations between activity measures and sleep outcomes"
+  ) +
+  theme_bw(base_size = 12)
+pforest
+ggsave(pforest,filename = "plots_out/sleepother_forest.png", width = 10, height = 6)
+
+```
+
+*Note:* Residual diagnostics suggested approximate normality, with only mild heteroscedasticity observed and no influential outliers detected. 
+
+
+# PA and sleep sensitivity analysis
+
+## Individual PA variables and sleep 
+
+```{r sens_sleepandpa}
+# WASO
+waso_inact.mod <- lmer(log(WASO) ~ dur_day_total_IN_min + timepoint + (1 | ID), data = full_dat)
+waso_lig.mod   <- lmer(log(WASO) ~ dur_day_total_LIG_min + timepoint + (1 | ID), data = full_dat)
+waso_mvpa.mod  <- lmer(log(WASO) ~ mvpa_dur + timepoint + (1 | ID), data = full_dat)
+
+#TST
+tst_inact.mod <- lmer(TST ~ dur_day_total_IN_min + timepoint + (1 | ID), data = full_dat)
+tst_lig.mod   <- lmer(TST ~ dur_day_total_LIG_min + timepoint + (1 | ID), data = full_dat)
+tst_mvpa.mod  <- lmer(TST ~ mvpa_dur + timepoint + (1 | ID), data = full_dat)
+
+#SE
+se_inact.mod <- lmer(SE ~ dur_day_total_IN_min + timepoint + (1 | ID), data = full_dat)
+se_lig.mod   <- lmer(SE ~ dur_day_total_LIG_min + timepoint + (1 | ID), data = full_dat)
+se_mvpa.mod  <- lmer(SE ~ mvpa_dur + timepoint + (1 | ID), data = full_dat)
+
+extract_single_pa <- function(model, outcome, predictor_label, predictor_term) {
+  tidy(model, effects = "fixed", conf.int = TRUE, conf.method = "Wald") %>%
+    filter(term == predictor_term) %>%
+    mutate(
+      outcome = outcome,
+      predictor = predictor_label,
+      # exponentiate only for WASO
+      estimate_adj = case_when(
+        outcome == "WASO" ~ (exp(estimate) - 1) * 100,
+        TRUE ~ estimate
+      ),
+      conf.low_adj = case_when(
+        outcome == "WASO" ~ (exp(conf.low) - 1) * 100,
+        TRUE ~ conf.low
+      ),
+      conf.high_adj = case_when(
+        outcome == "WASO" ~ (exp(conf.high) - 1) * 100,
+        TRUE ~ conf.high
+      ),
+
+      result = case_when(
+        outcome == "WASO" ~ paste0(
+          round(estimate_adj, 1), "% [",
+          round(conf.low_adj, 1), ", ",
+          round(conf.high_adj, 1), "], p = ",
+          format.pval(p.value, digits = 3, eps = .001)
+        ),
+        outcome == "SE" ~ paste0(
+          round(estimate_adj, 4),
+          " [",
+          round(conf.low_adj, 4),
+          ", ",
+          round(conf.high_adj, 4),
+          "], p = ",
+          format.pval(p.value, digits = 3, eps = .001)
+        ),
+        TRUE ~ paste0(
+          round(estimate_adj, 2),
+          " [",
+          round(conf.low_adj, 2),
+          ", ",
+          round(conf.high_adj, 2),
+          "], p = ",
+          format.pval(p.value, digits = 3, eps = .001)
+        )
+      )
+    ) %>%
+    select(predictor, outcome, result)
+}
+
+
+single_pa_sleep_results <- bind_rows(
+  extract_single_pa(waso_inact.mod, "WASO", "Inactive duration", "dur_day_total_IN_min"),
+  extract_single_pa(waso_lig.mod,   "WASO", "Light activity duration", "dur_day_total_LIG_min"),
+  extract_single_pa(waso_mvpa.mod,  "WASO", "MVPA duration", "mvpa_dur"),
+  
+  extract_single_pa(tst_inact.mod, "TST", "Inactive duration", "dur_day_total_IN_min"),
+  extract_single_pa(tst_lig.mod,   "TST", "Light activity duration", "dur_day_total_LIG_min"),
+  extract_single_pa(tst_mvpa.mod,  "TST", "MVPA duration", "mvpa_dur"),
+  
+  extract_single_pa(se_inact.mod, "SE", "Inactive duration", "dur_day_total_IN_min"),
+  extract_single_pa(se_lig.mod,   "SE", "Light activity duration", "dur_day_total_LIG_min"),
+  extract_single_pa(se_mvpa.mod,  "SE", "MVPA duration", "mvpa_dur")
+) %>%
+  pivot_wider(
+    names_from = outcome,
+    values_from = result
+  )
+
+single_pa_sleep_results %>% kable(
+  caption = "Single-predictor sensitivity models examining associations between physical activity variables and sleep outcomes."
+) %>% kable_styling() %>% add_footnote("Each cell reports the unstandardised coefficient for the physical activity predictor from a separate linear mixed-effects model adjusted for timepoint, with a random intercept for participant ID. Values are presented as b [95% CI], p. WASO coefficients are expressed as percentage change due to log transformation. Confidence intervals were estimated using the Wald method.", notation="alphabet")
+```
+
